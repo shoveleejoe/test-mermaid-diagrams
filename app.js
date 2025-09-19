@@ -1,97 +1,71 @@
-// app.js — main thread controller for the Pyodide worker
 const statusEl = document.getElementById("status");
-const vizroIframe = document.getElementById("vizro-html");
-const plotlyRoot = document.getElementById("plotly-root");
+const iframe = document.getElementById("vizro-iframe");
+const tabsEl = document.getElementById("tabs");
+const panels = Array.from(document.querySelectorAll(".panel"));
 
-// important for GitHub Pages subpath hosting: use a relative worker URL
+function setStatus(t){ statusEl.textContent = t; }
+
+// Basic tabs (fallback UI)
+tabsEl.addEventListener("click", (e) => {
+  if (e.target.tagName !== "BUTTON") return;
+  const id = e.target.getAttribute("data-tab");
+  for (const btn of tabsEl.querySelectorAll("button")) btn.classList.toggle("active", btn === e.target);
+  for (const p of panels) p.classList.toggle("active", p.id === id);
+});
+
+// Worker plumbing
 const worker = new Worker("./py-worker.js", { type: "module" });
-
-// simple request/response correlate by id
-let nextId = 1;
-const pending = new Map();
-
+let seq = 1;
+const waits = new Map();
 worker.onmessage = (evt) => {
   const { type, id, payload, error } = evt.data || {};
-  if (type === "status") {
-    statusEl.textContent = payload;
-    return;
-  }
-  if (type === "result") {
-    const resolver = pending.get(id);
-    pending.delete(id);
-    if (!resolver) return;
-
-    if (error) {
-      statusEl.textContent = `error: ${error}`;
-      console.error(error);
-      resolver.reject(new Error(error));
-      return;
-    }
-
-    // Prefer Vizro HTML if present
-    if (payload && payload.html) {
-      const html = payload.html;
-      // write the HTML into the iframe via srcdoc
-      vizroIframe.srcdoc = html;
-      vizroIframe.style.display = "block";
-      plotlyRoot.style.display = "none";
-      statusEl.textContent = "rendered Vizro HTML from Pyodide.";
-      resolver.resolve(payload);
-      return;
-    }
-
-    // Fallback: Plotly JSON
-    if (payload && payload.plotly) {
-      const { figure, layout } = payload.plotly;
-      vizroIframe.style.display = "none";
-      plotlyRoot.style.display = "block";
-      if (window.Plotly) {
-        window.Plotly.newPlot("plotly-root", figure.data, layout || figure.layout || {}, {
-          responsive: true,
-          displayModeBar: true
-        });
-        statusEl.textContent = "rendered Plotly (fallback) from Pyodide.";
-      } else {
-        statusEl.textContent = "plotly.js not available for fallback.";
-      }
-      resolver.resolve(payload);
-      return;
-    }
-
-    // Nothing recognized
-    statusEl.textContent = "worker returned no renderable payload.";
-    resolver.resolve(payload);
+  if (type === "status"){ setStatus(payload); return; }
+  if (type === "result"){
+    const w = waits.get(id); waits.delete(id);
+    if (!w) return;
+    if (error){ w.reject(new Error(error)); setStatus("error: " + error); return; }
+    w.resolve(payload);
   }
 };
-
-function callWorker(kind, data = {}) {
+function call(kind, payload){
   return new Promise((resolve, reject) => {
-    const id = nextId++;
-    pending.set(id, { resolve, reject });
-    worker.postMessage({ type: kind, id, payload: data });
+    const id = seq++;
+    waits.set(id, { resolve, reject });
+    worker.postMessage({ type: kind, id, payload });
   });
 }
 
-// 1) initialize pyodide + install packages (vizro attempt)
-await callWorker("init", {
+// 1) Initialize Pyodide + packages
+await call("init", {
   pyodideIndexURL: "https://cdn.jsdelivr.net/pyodide/v0.28.2/full/",
-  // You can pin specific versions here; leave as-is to try latest compatible wheels
-  micropipPackages: [
-    // Try Vizro first; if this fails in Pyodide, fallback code will still run.
-    "vizro",
-    // dash/plotly are pure-Python and typically fine; some vizro builds may already depend upon them.
-    "dash",
-    "plotly",
-  ],
-  // Preload some common scientific packages from the Pyodide distribution
-  pyodidePackages: [
-    "numpy",
-    "pandas"
-  ]
+  pyodidePackages: ["numpy", "pandas"],    // distro packages (fast) :contentReference[oaicite:2]{index=2}
+  micropipPackages: ["vizro", "plotly", "dash"] // pure-Python wheels via micropip (best-effort)
 });
 
-// 2) ask the worker to run our "vizro or plotly" one-pager
-await callWorker("run_vizro_or_plotly", {
-  title: "Vizro One-Page Demo",
-  note: "Rendered entirely in-browser via Pyodide. Falls back to Plotly if Vizro import fails."
-});
+// 2) Ask worker to build Vizro HTML (if possible) OR return Plotly JSON for both tabs
+const out = await call("build_dashboard", { dataset: "d6yy-54nr" });
+
+if (out && out.html){
+  // Vizro (WASM) path: show exported HTML in iframe (if your Vizro version provides this)
+  iframe.srcdoc = out.html;
+  iframe.style.display = "block";
+  // hide fallback UI
+  tabsEl.style.display = "none";
+  for (const p of panels) p.style.display = "none";
+  setStatus("rendered Vizro dashboard via Pyodide (WASM).");
+} else if (out && out.figures) {
+  // Fallback: render Plotly figs for both tabs
+  const figs = out.figures;
+  const P = window.Plotly;
+  const plot = (id, fig) => P.newPlot(id, fig.data, fig.layout || {}, { responsive: true });
+  await plot("fig_white_hist", figs.white_hist);
+  await plot("fig_pb_hist", figs.pb_hist);
+  await plot("fig_overdue", figs.overdue);
+  await plot("fig_pp_year", figs.pp_year);
+  await plot("fig_dow", figs.dow);
+  await plot("fig_pairs_heatmap", figs.pairs_heatmap);
+  await plot("fig_sum_spread", figs.sum_spread);
+  setStatus("rendered Plotly fallback (two tabs) from Pyodide worker.");
+} else {
+  setStatus("No renderable payload from worker.");
+}

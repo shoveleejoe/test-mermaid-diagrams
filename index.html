@@ -2,41 +2,59 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1, viewport-fit=cover"
-  />
-  <title>Vizro + Pyodide (Worker) — GH Pages Starter</title>
-
-  <!-- Minimal styling -->
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Powerball Explorer — Vizro + Pyodide (Worker)</title>
   <style>
-    :root { --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace; }
-    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    header { padding: 16px 20px; border-bottom: 1px solid #eee; }
-    main { padding: 20px; max-width: 1200px; margin: 0 auto; }
-    .status { font: 12px var(--mono); color: #444; background:#f6f6f6; border:1px solid #eee; padding:8px 10px; border-radius:8px; }
-    #vizro-html { border: 0; width: 100%; height: 800px; display: none; }
-    #plotly-root { width: 100%; height: 800px; display: none; }
+    :root { --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
+    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
+    header { padding: 12px 16px; border-bottom: 1px solid #eee; }
+    .status { font: 12px var(--mono); background:#f8f8f8; border:1px solid #eee; padding:6px 8px; border-radius:8px; display:inline-block; }
+    main { max-width: 1200px; margin: 0 auto; padding: 16px; }
+    nav.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
+    nav.tabs button { border:1px solid #ddd; background:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    nav.tabs button.active { background:#f0f7ff; border-color:#9ec5ff; }
+    #vizro-iframe { width:100%; height:900px; border:0; display:none; }
+    .panel { display:none; }
+    .panel.active { display:block; }
+    #tab1, #tab2 { min-height: 860px; }
+    .grid { display:grid; grid-template-columns: 1fr; gap: 16px; }
+    @media (min-width: 1000px){ .grid { grid-template-columns: 1fr 1fr; } }
   </style>
-
-  <!-- Plotly (only needed for fallback rendering) -->
+  <!-- Plotly for fallback rendering -->
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
-
-  <!-- App bootstrap -->
   <script type="module" src="./app.js" defer></script>
 </head>
 <body>
   <header>
-    <h1>Vizro + Pyodide (Web Worker) — GitHub Pages</h1>
+    <h1>Powerball Explorer — Vizro + Pyodide (Web Worker)</h1>
     <div id="status" class="status">booting…</div>
   </header>
-
   <main>
-    <!-- If Vizro (in Pyodide) can produce static HTML, we show it in an iframe -->
-    <iframe id="vizro-html" title="Vizro Dashboard"></iframe>
+    <!-- If Vizro can render to self-contained HTML, we’ll inject it here -->
+    <iframe id="vizro-iframe" title="Vizro Dashboard"></iframe>
 
-    <!-- Otherwise, we’ll render a Plotly figure here as a fallback -->
-    <div id="plotly-root"></div>
+    <!-- Fallback tab UI (Plotly JSON rendered client-side) -->
+    <nav class="tabs" id="tabs">
+      <button data-tab="tab1" class="active">Explorer</button>
+      <button data-tab="tab2">Combos & Trends</button>
+    </nav>
+
+    <section id="tab1" class="panel active">
+      <div class="grid">
+        <div id="fig_white_hist"></div>
+        <div id="fig_pb_hist"></div>
+        <div id="fig_overdue"></div>
+        <div id="fig_pp_year"></div>
+        <div id="fig_dow"></div>
+      </div>
+    </section>
+
+    <section id="tab2" class="panel">
+      <div class="grid">
+        <div id="fig_pairs_heatmap"></div>
+        <div id="fig_sum_spread"></div>
+      </div>
+    </section>
   </main>
 </body>
 </html>
