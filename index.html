@@ -2,26 +2,58 @@
 <html lang="en">
 <head>
   <meta charset="utf-8" />
-  <meta name="viewport" content="width=device-width, initial-scale=1" />
-  <title>Powerball Explorer — Vizro + Pyodide (Worker)</title>
+  <meta
+    name="viewport"
+    content="width=device-width, initial-scale=1, viewport-fit=cover"
+  />
+  <title>Powerball Explorer — Vizro + Pyodide (Web Worker)</title>
+
+  <!-- Minimal styling -->
   <style>
-    :root { --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; }
-    body { margin:0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; }
-    header { padding: 12px 16px; border-bottom: 1px solid #eee; }
-    .status { font: 12px var(--mono); background:#f8f8f8; border:1px solid #eee; padding:6px 8px; border-radius:8px; display:inline-block; }
-    main { max-width: 1200px; margin: 0 auto; padding: 16px; }
-    nav.tabs { display: flex; gap: 8px; margin-bottom: 12px; }
-    nav.tabs button { border:1px solid #ddd; background:#fff; padding:8px 12px; border-radius:8px; cursor:pointer; }
+    :root {
+      --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, "Liberation Mono", monospace;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif; color: #111; background:#fff; }
+    header { padding: 16px 20px; border-bottom: 1px solid #eee; background:#fafafa; }
+    h1 { margin: 0 0 6px 0; font-size: 20px; }
+    .status { font: 12px var(--mono); color: #1f3d5a; background:#eef6ff; border:1px solid #d6e9ff; padding:8px 10px; border-radius:8px; display:inline-block; }
+    main { padding: 16px; max-width: 1200px; margin: 0 auto; }
+
+    /* Logs panel */
+    details.logs { margin: 12px 0; }
+    details.logs summary { cursor: pointer; font-weight: 600; }
+    pre#log-view {
+      max-height: 260px; overflow: auto; margin: 8px 0 0 0; padding: 10px;
+      background: #0b1020; color: #bfe5ff; border-radius: 8px; border:1px solid #0e1530;
+      font: 12px/1.5 var(--mono);
+    }
+
+    /* Tabs (fallback UI – used when Vizro HTML export isn't available) */
+    nav.tabs { display: flex; gap: 8px; margin: 12px 0 16px 0; }
+    nav.tabs button {
+      border:1px solid #ddd; background:#fff; padding:8px 12px; border-radius:8px; cursor:pointer;
+      font: 13px/1 var(--mono);
+    }
     nav.tabs button.active { background:#f0f7ff; border-color:#9ec5ff; }
-    #vizro-iframe { width:100%; height:900px; border:0; display:none; }
+
+    /* Panels */
     .panel { display:none; }
     .panel.active { display:block; }
     #tab1, #tab2 { min-height: 860px; }
+
+    /* Simple responsive grid for charts */
     .grid { display:grid; grid-template-columns: 1fr; gap: 16px; }
     @media (min-width: 1000px){ .grid { grid-template-columns: 1fr 1fr; } }
+
+    /* Iframe for Vizro-rendered HTML (when available) */
+    #vizro-iframe { border: 0; width: 100%; height: 900px; display: none; }
   </style>
-  <!-- Plotly for fallback rendering -->
+
+  <!-- Plotly (for client-side rendering in the fallback path) -->
   <script src="https://cdn.plot.ly/plotly-2.35.2.min.js" defer></script>
+
+  <!-- App bootstrap (main thread controller + logging + worker plumbing) -->
   <script type="module" src="./app.js" defer></script>
 </head>
 <body>
@@ -29,16 +61,25 @@
     <h1>Powerball Explorer — Vizro + Pyodide (Web Worker)</h1>
     <div id="status" class="status">booting…</div>
   </header>
+
   <main>
-    <!-- If Vizro can render to self-contained HTML, we’ll inject it here -->
+    <!-- Optional: live logs panel -->
+    <details class="logs" open>
+      <summary>Logs</summary>
+      <pre id="log-view">(live logs will appear here)
+</pre>
+    </details>
+
+    <!-- If Vizro-in-Pyodide can export self-contained HTML, we show it here -->
     <iframe id="vizro-iframe" title="Vizro Dashboard"></iframe>
 
-    <!-- Fallback tab UI (Plotly JSON rendered client-side) -->
+    <!-- Fallback UI: two tabs rendered with Plotly JSON returned from the worker -->
     <nav class="tabs" id="tabs">
       <button data-tab="tab1" class="active">Explorer</button>
-      <button data-tab="tab2">Combos & Trends</button>
+      <button data-tab="tab2">Combos &amp; Trends</button>
     </nav>
 
+    <!-- Tab 1: Explorer -->
     <section id="tab1" class="panel active">
       <div class="grid">
         <div id="fig_white_hist"></div>
@@ -49,6 +90,7 @@
       </div>
     </section>
 
+    <!-- Tab 2: Combinations & Trends -->
     <section id="tab2" class="panel">
       <div class="grid">
         <div id="fig_pairs_heatmap"></div>
