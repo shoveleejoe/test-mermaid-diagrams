@@ -1,18 +1,22 @@
-// py-worker.js — Pyodide Web Worker with structured logging, stdout/err capture,
-// performance marks, and a Vizro-or-Plotly build pipeline (open_url + datetime-safe).
+// py-worker.js — Pyodide Web Worker with module-based Python + hot-reload
 //
-// Messages supported:
-//   { type: "init", id, payload: { pyodideIndexURL, pyodidePackages[], micropipPackages[] } }
-//   { type: "build_dashboard", id, payload: { dataset: "d6yy-54nr" } }
+// What this worker does:
+// - Loads Pyodide in a Web Worker (official pattern)                     [docs]
+// - Fetches ./dashboard.py, writes it to the Pyodide VFS, imports it     [docs]
+// - Hot-reloads the module on each build (invalidate caches + reimport)   [docs]
+// - Calls dashboard.build_dashboard(dataset) and returns either HTML or Plotly JSON
 //
-// Returns either:
-//   { type: "result", id, payload: { html } }   // if Vizro HTML export is available
-//   { type: "result", id, payload: { figures } } // Plotly JSON fallback
-// or: { type: "result", id, error: "..." }
+// Refs:
+// • Web worker usage: https://pyodide.org/en/stable/usage/webworker.html
+// • Virtual FS + loading custom code: https://pyodide.org/en/stable/usage/loading-custom-python-code.html
+// • VFS behavior: https://pyodide.org/en/stable/usage/file-system.html
+// • pyodide.pyimport / JS API: https://pyodide.org/en/stable/usage/api/js-api.html
+// • importlib.reload / sys.modules: https://docs.python.org/3/library/importlib.html
+// • pyodide.http.open_url (used inside dashboard.py): https://pyodide.org/en/stable/usage/api/python-api/http.html
 
 let pyodide = null;
 
-// --------------- worker-side logging & timing ---------------
+/* ---------------- logging helpers ---------------- */
 function sendStatus(msg, level = "info", extra = undefined) {
   postMessage({ type: "status", payload: msg, level, extra });
 }
@@ -23,14 +27,10 @@ function wlog(level, scope, msg, extra = {}) {
   (console[level] || console.log)(`[${scope}] ${msg}`, extra);
   sendStatus(`[${scope}] ${msg}`, level, extra);
 }
-function wmark(name) {
-  try { performance.mark(name); } catch {}
-}
-function wmeasure(name, start, end) {
-  try { performance.measure(name, start, end); } catch {}
-}
+function wmark(name) { try { performance.mark(name); } catch {} }
+function wmeasure(name, start, end) { try { performance.measure(name, start, end); } catch {} }
 
-// --------------- message handler ---------------
+/* ---------------- message handler ---------------- */
 self.onmessage = async (evt) => {
   const { type, id, payload } = evt.data || {};
   try {
@@ -44,6 +44,12 @@ self.onmessage = async (evt) => {
       sendResult(id, out);
       return;
     }
+    if (type === "hot_reload") {
+      // optional control message to just re-fetch/re-import module
+      await ensureDashboardModule(true);
+      sendResult(id, { reloaded: true });
+      return;
+    }
   } catch (e) {
     console.error(e);
     wlog("error", "worker", "unhandled error", { error: String(e && e.stack ? e.stack : e) });
@@ -51,7 +57,7 @@ self.onmessage = async (evt) => {
   }
 };
 
-// --------------- initialization ---------------
+/* ---------------- init ---------------- */
 async function initPyodideAndPackages(opts) {
   const {
     pyodideIndexURL = "https://cdn.jsdelivr.net/pyodide/v0.28.2/full/",
@@ -61,36 +67,33 @@ async function initPyodideAndPackages(opts) {
 
   wlog("info", "init", "loading pyodide", { indexURL: pyodideIndexURL });
   wmark("init:pyodide:start");
-
   const { loadPyodide } = await import(`${pyodideIndexURL}pyodide.mjs`);
   pyodide = await loadPyodide({ indexURL: pyodideIndexURL });
-
   wmark("init:pyodide:end"); wmeasure("init:pyodide", "init:pyodide:start", "init:pyodide:end");
   wlog("info", "init", "pyodide ready");
 
-  // Redirect Python stdout/stderr → worker logs → main UI
   try {
     pyodide.setStdout({ batched: (s) => s && wlog("info", "py.stdout", s) });
     pyodide.setStderr({ batched: (s) => s && wlog("error", "py.stderr", s) });
-    // pyodide.setDebug?.(true); // uncomment for verbose diagnostics
     wlog("info", "init", "wired py stdout/stderr");
   } catch (e) {
     wlog("warn", "init", "setStdout/Err failed", { error: String(e) });
   }
 
-  // Load packages from the Pyodide distribution (fast, prebuilt)
+  // Preload distro packages (numpy/pandas etc.)
   for (const pkg of pyodidePackages) {
     try {
       wlog("info", "init", `load distro package`, { pkg });
       wmark(`init:pkg:${pkg}:start`);
       await pyodide.loadPackage(pkg);
-      wmark(`init:pkg:${pkg}:end`); wmeasure(`init:pkg:${pkg}`, `init:pkg:${pkg}:start`, `init:pkg:${pkg}:end`);
+      wmark(`init:pkg:${pkg}:end`);
+      wmeasure(`init:pkg:${pkg}`, `init:pkg:${pkg}:start`, `init:pkg:${pkg}:end`);
     } catch (e) {
       wlog("warn", "init", "loadPackage failed", { pkg, error: String(e) });
     }
   }
 
-  // Install pure-Python wheels via micropip (best-effort)
+  // Install pure-Python wheels via micropip (vizro, plotly, dash, …)
   if (micropipPackages && micropipPackages.length) {
     try {
       wlog("info", "init", "loading micropip");
@@ -117,177 +120,92 @@ for name in pkgs:
   wlog("info", "init", "initialization complete");
 }
 
-// --------------- dashboard build ---------------
-async function buildDashboard({ dataset = "d6yy-54nr" } = {}) {
-  wlog("info", "build", "fetching & computing", { dataset });
+/* ---------------- Python module loading & hot-reload ---------------- */
 
-  const py = `
-import sys, json, math, itertools, logging
-from datetime import datetime, timezone
-import pandas as pd
-import numpy as np
-from pyodide.http import open_url  # first-party browser-aware helper (sync)  # refs: pyodide docs  :contentReference[oaicite:1]{index=1}
+/**
+ * Ensure ./dashboard.py is present in the Pyodide VFS and imported as module "dashboard".
+ * If hotReload is true, force a re-import by invalidating caches and dropping sys.modules entry.
+ *
+ * This uses:
+ *  - FS.writeFile + sys.path tweak to make "/app" importable  (Pyodide VFS)     [docs]
+ *  - importlib.invalidate_caches() + sys.modules deletion or reload (hot)       [docs]
+ *  - pyodide.pyimport("dashboard") to get a callable PyProxy in JS              [docs]
+ */
+async function ensureDashboardModule(hotReload = true, url = "./dashboard.py", vfsPath = "/app/dashboard.py", modName = "dashboard") {
+  wlog("info", "module", `fetching ${url}`, { hotReload });
+  const resp = await fetch(`${url}?v=${Date.now()}`, { cache: "no-cache" }); // dev-friendly cache-bust
+  if (!resp.ok) throw new Error(`Failed to fetch ${url}: ${resp.status}`);
+  const code = await resp.text();
 
-# ---------- logging ----------
-logger = logging.getLogger("pb.pipeline")
-logger.setLevel(logging.DEBUG)
-_sh = logging.StreamHandler(sys.stdout)
-_sh.setLevel(logging.DEBUG)
-_sh.setFormatter(logging.Formatter('%(asctime)s %(levelname)s %(name)s %(message)s'))
-if not logger.handlers:
-    logger.addHandler(_sh)
-logger.info("bootstrap python logging started")
+  // Write/overwrite file in the in-memory FS; ensure directory exists first.
+  pyodide.FS.mkdirTree("/app");
+  pyodide.FS.writeFile(vfsPath, code, { encoding: "utf8" }); // VFS write  :contentReference[oaicite:4]{index=4}
 
-# ---------- fetch (via open_url → file-like stream for pandas.read_json) ----------
-base = f"https://data.ny.gov/resource/${dataset}.json?$select=draw_date,winning_numbers,multiplier&$order=draw_date%20ASC&$limit=50000"
-logger.info("fetch begin", extra={"stage":"fetch","endpoint":base})
-df = pd.read_json(open_url(base))  # pandas accepts file-like objects (StringIO)  # refs: pandas docs  :contentReference[oaicite:2]{index=2}
-logger.info("fetch ok", extra={"rows": int(df.shape[0])})
+  // Make sure Python can import from /app
+  await pyodide.runPythonAsync(`
+import sys
+if "/app" not in sys.path:
+    sys.path.insert(0, "/app")
+`);
 
-# Keep as datetime64[ns, UTC] (do NOT .dt.date)
-df["draw_date"] = pd.to_datetime(df["draw_date"], utc=True)
-
-# ---------- parse ----------
-logger.info("parse numbers begin")
-parts = df["winning_numbers"].str.split(" ", expand=True).astype(int)
-whites = parts[[0,1,2,3,4]]
-powerball = parts[5]
-white_df = pd.DataFrame({
-    "draw_date": df["draw_date"].repeat(5).values,
-    "white_ball": whites.stack().reset_index(level=1, drop=True).values
-})
-pb_df = pd.DataFrame({"draw_date": df["draw_date"], "powerball": powerball})
-logger.info("parse numbers done", extra={"white_rows": int(white_df.shape[0])})
-
-# ---------- bonus sanity checks ----------
-logger.info(f"dtypes after parse: {df.dtypes.to_dict()}")
-logger.info(f"draw_date dtype: {df['draw_date'].dtype}")  # expect datetime64[ns, UTC]
-
-# ---------- aggregates ----------
-today = df["draw_date"].max()  # Timestamp
-last_seen = white_df.groupby("white_ball")["draw_date"].max()
-logger.info(f"last_seen dtype: {last_seen.dtype}")         # expect datetime64[ns, UTC]
-
-overdue = (today - last_seen).dt.days
-overdue_df = (
-    overdue.sort_values(ascending=False)
-            .rename("days")
-            .reset_index()
-            .rename(columns={"index": "white_ball"})
-)
-
-df["year"] = df["draw_date"].dt.year
-df["dow"]  = df["draw_date"].dt.day_name()
-pp_year = df.groupby(["year","multiplier"]).size().reset_index(name="count")
-dow     = df["dow"].value_counts().sort_index()
-
-# Top 30 white-ball pairs
-def row_pairs(row):
-    balls = row.values
-    return list(itertools.combinations(sorted(balls), 2))
-pair_counts = {}
-for i in range(whites.shape[0]):
-    for pair in row_pairs(whites.iloc[i]):
-        pair_counts[pair] = pair_counts.get(pair, 0) + 1
-top_pairs = sorted(pair_counts.items(), key=lambda kv: kv[1], reverse=True)[:30]
-pairs_df = pd.DataFrame([(a,b,c) for ((a,b),c) in top_pairs], columns=["a","b","count"])
-
-# Sum & spread over time
-sums = whites.sum(axis=1)
-spreads = whites.max(axis=1) - whites.min(axis=1)
-trend_df = pd.DataFrame({"draw_date": df["draw_date"], "sum": sums, "spread": spreads})
-
-# ---------- figures (Plotly), attempt Vizro export if available ----------
-result = {}
-
-try:
-    import plotly.express as px
-    import plotly.graph_objects as go
-
-    fig_white_hist = px.histogram(white_df, x="white_ball", nbins=69, title="White-ball Frequency (1–69)")
-    fig_pb_hist    = px.histogram(pb_df,   x="powerball",  nbins=26, title="Powerball Frequency (1–26)")
-    fig_overdue    = px.bar(overdue_df, x="white_ball", y="days", title=f"Overdue (days) as of {today.date()}")
-    fig_pp_year    = px.bar(pp_year, x="year", y="count", color="multiplier", barmode="stack", title="Power Play usage by year")
-    fig_dow        = px.bar(dow, title="Draws by Day of Week")
-
-    mat = pairs_df.pivot_table(index="a", columns="b", values="count").fillna(0)
-    fig_pairs_heatmap = go.Figure(data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title="count")))
-    fig_pairs_heatmap.update_layout(title="Top Pair Combinations (counts)")
-
-    fig_sum_spread = go.Figure()
-    fig_sum_spread.add_trace(go.Scatter(x=trend_df["draw_date"], y=trend_df["sum"],    mode="lines", name="sum(whites)"))
-    fig_sum_spread.add_trace(go.Scatter(x=trend_df["draw_date"], y=trend_df["spread"], mode="lines", name="spread(max-min)"))
-    fig_sum_spread.update_layout(title="Sum & Spread over Time")
-
+  // Hot reload: prefer importlib.reload when module exists; else clean sys.modules and reimport.
+  if (hotReload) {
+    await pyodide.runPythonAsync(`
+import sys, importlib
+importlib.invalidate_caches()
+if "${modName}" in sys.modules:
     try:
-        import vizro
-        import vizro.components as vz
-        from vizro.models import Page, Dashboard
-
-        page1 = Page(
-            title="Explorer",
-            components=[
-                vz.Graph(figure=fig_white_hist),
-                vz.Graph(figure=fig_pb_hist),
-                vz.Graph(figure=fig_overdue),
-                vz.Graph(figure=fig_pp_year),
-                vz.Graph(figure=fig_dow),
-            ],
-        )
-        page2 = Page(
-            title="Combos & Trends",
-            components=[
-                vz.Graph(figure=fig_pairs_heatmap),
-                vz.Graph(figure=fig_sum_spread),
-            ],
-        )
-        app = Dashboard(pages=[page1, page2])
-
-        // If your Vizro build exposes an HTML export (e.g., app.to_html()), flip CAN_EXPORT=True.
-        CAN_EXPORT = false
-        if CAN_EXPORT:
-            html = app.to_html()  # replace with the correct API for your version
-            result["html"] = html
-        else:
-            raise RuntimeError("vizro export disabled; returning plotly JSON fallback")
-
-    except Exception as vizro_err:
-        logger.info(f"vizro export unavailable -> fallback: {vizro_err}")
-        result["figures"] = {
-            "white_hist": json.loads(fig_white_hist.to_json()),
-            "pb_hist":    json.loads(fig_pb_hist.to_json()),
-            "overdue":    json.loads(fig_overdue.to_json()),
-            "pp_year":    json.loads(fig_pp_year.to_json()),
-            "dow":        json.loads(fig_dow.to_json()),
-            "pairs_heatmap": json.loads(fig_pairs_heatmap.to_json()),
-            "sum_spread":    json.loads(fig_sum_spread.to_json()),
-        }
-
-except Exception as e:
-    result = {"error": str(e)}
-
-json.dumps(result)
-`;
-
-  wmark("build:py:start");
-  const out = await pyodide.runPythonAsync(py);
-  wmark("build:py:end"); wmeasure("build:py", "build:py:start", "build:py:end");
-
-  const obj = JSON.parse(out);
-
-  if (obj && obj.html) {
-    wlog("info", "build", "produced Vizro HTML");
-    return { html: obj.html };
-  }
-  if (obj && obj.figures) {
-    wlog("info", "build", "produced Plotly figures", { keys: Object.keys(obj.figures || {}) });
-    return { figures: obj.figures };
-  }
-  if (obj && obj.error) {
-    wlog("error", "build", "python error", { error: obj.error });
-    throw new Error(obj.error);
+        importlib.reload(sys.modules["${modName}"])  # official reload API
+    except Exception:
+        # fallback: drop and let a fresh import occur
+        del sys.modules["${modName}"]
+`);
   }
 
-  wlog("warn", "build", "no payload generated");
-  return {};
+  // Import the module into JS space as a PyProxy
+  // (pyodide.pyimport is the documented API for this)
+  const mod = pyodide.pyimport(modName); // PyProxy  :contentReference[oaicite:5]{index=5}
+  return mod;
+}
+
+/* ---------------- build ---------------- */
+async function buildDashboard({ dataset = "d6yy-54nr", hotReload = true } = {}) {
+  wlog("info", "build", "loading dashboard.py as module", { dataset, hotReload });
+
+  const dash = await ensureDashboardModule(hotReload);
+  try {
+    wmark("build:py:start");
+
+    // Call Python: dashboard.build_dashboard(dataset) -> Python dict
+    const resultPy = dash.build_dashboard(dataset);
+
+    // Convert Python dict (PyProxy) to a plain JS object
+    const obj = resultPy.toJs({ dict_converter: Object.fromEntries }); //  :contentReference[oaicite:6]{index=6}
+
+    // Clean up proxies to avoid leaks (optional but good hygiene)
+    resultPy.destroy?.();
+    dash.destroy?.();
+
+    wmark("build:py:end"); wmeasure("build:py", "build:py:start", "build:py:end");
+
+    if (obj && obj.html) {
+      wlog("info", "build", "produced Vizro HTML");
+      return { html: obj.html };
+    }
+    if (obj && obj.figures) {
+      wlog("info", "build", "produced Plotly figures", { keys: Object.keys(obj.figures || {}) });
+      return { figures: obj.figures };
+    }
+    if (obj && obj.error) {
+      wlog("error", "build", "python error", { error: obj.error });
+      throw new Error(obj.error);
+    }
+
+    wlog("warn", "build", "no payload generated");
+    return {};
+  } catch (e) {
+    // If execution fails, include some context
+    wlog("error", "build", "exception during build", { error: String(e && e.stack ? e.stack : e) });
+    throw e;
+  }
 }
