@@ -1,9 +1,14 @@
 # dashboard.py
-import sys, json, math, itertools, logging
+import sys, json, itertools, logging
 from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
-from pyodide.http import open_url  # browser-aware, returns a file-like StringIO (sync)  # docs: pyodide.http.open_url
+from pyodide.http import open_url  # file-like for pandas.read_json (Pyodide)  # docs: open_url returns StringIO
+
+# Vizro (models + PX wrapper + capture for custom charts)
+import vizro.models as vm
+import vizro.plotly.express as vpx
+from vizro.models.types import capture
 
 # ---------- logging ----------
 logger = logging.getLogger("pb.pipeline")
@@ -24,12 +29,12 @@ def build_dashboard(dataset: str = "d6yy-54nr"):
         "$order=draw_date%20ASC&$limit=50000"
     )
     logger.info("fetch begin")
-    # open_url -> file-like object that pandas.read_json can read synchronously
-    df = pd.read_json(open_url(base))  # pyodide docs confirm this returns StringIO-compatible object
+    # open_url -> StringIO-like; pandas.read_json accepts file-like objects
+    df = pd.read_json(open_url(base))
     logger.info("fetch ok")
 
-    # Keep draw_date as *timezone-aware UTC* (pandas returns datetime64[ns, UTC] with utc=True)
-    df["draw_date"] = pd.to_datetime(df["draw_date"], utc=True)  # docs: pandas.to_datetime(utc=True)
+    # timezone-aware UTC datetimes
+    df["draw_date"] = pd.to_datetime(df["draw_date"], utc=True)  # tz-aware UTC
 
     # ---------- parse numbers ----------
     logger.info("parse numbers begin")
@@ -37,33 +42,35 @@ def build_dashboard(dataset: str = "d6yy-54nr"):
     whites = parts[[0, 1, 2, 3, 4]]
     powerball = parts[5]
 
-    # Important: preserve tz-aware dtype by NOT using .values on draw_date
+    # preserve tz-aware dtype by not using .values on draw_date
     white_df = pd.DataFrame({
         "draw_date": df["draw_date"].repeat(5).reset_index(drop=True),
-        "white_ball": whites.stack().reset_index(level=1, drop=True).astype(int).reset_index(drop=True),
+        "white_ball": (
+            whites.stack()
+                  .reset_index(level=1, drop=True)
+                  .astype(int)
+                  .reset_index(drop=True)
+        ),
     })
     pb_df = pd.DataFrame({"draw_date": df["draw_date"], "powerball": powerball})
     logger.info("parse numbers done", extra={"white_rows": int(white_df.shape[0])})
 
-    # ---------- timezone hardening (guard) ----------
-    # If white_df['draw_date'] somehow became naive, localize; if aware, convert to UTC.
+    # ---------- timezone guard ----------
     if getattr(white_df["draw_date"].dtype, "tz", None) is None:
-        white_df["draw_date"] = white_df["draw_date"].dt.tz_localize("UTC")   # localize naive → aware (no clock shift)
+        white_df["draw_date"] = white_df["draw_date"].dt.tz_localize("UTC")
     else:
-        white_df["draw_date"] = white_df["draw_date"].dt.tz_convert("UTC")    # convert aware → UTC (preserve instant)
+        white_df["draw_date"] = white_df["draw_date"].dt.tz_convert("UTC")
 
     # ---------- sanity logs ----------
     logger.info(f"dtypes after parse: {df.dtypes.to_dict()}")
-    logger.info(f"draw_date dtype: {df['draw_date'].dtype}")                  # expect datetime64[ns, UTC]
-    logger.info(f"white_df.draw_date dtype: {white_df['draw_date'].dtype}")   # expect datetime64[ns, UTC]
+    logger.info(f"draw_date dtype: {df['draw_date'].dtype}")                # expect datetime64[ns, UTC]
+    logger.info(f"white_df.draw_date dtype: {white_df['draw_date'].dtype}") # expect datetime64[ns, UTC]
 
     # ---------- aggregates ----------
-    # Be explicit about UTC for 'today'
     today = df["draw_date"].max().tz_convert("UTC")
 
     last_seen = white_df.groupby("white_ball")["draw_date"].max()
-    logger.info(f"last_seen dtype: {last_seen.dtype}")                         # expect datetime64[ns, UTC]
-
+    logger.info(f"last_seen dtype: {last_seen.dtype}")                      # expect datetime64[ns, UTC]
     overdue = (today - last_seen).dt.days
     overdue_df = (
         overdue.sort_values(ascending=False)
@@ -75,26 +82,77 @@ def build_dashboard(dataset: str = "d6yy-54nr"):
     df["year"] = df["draw_date"].dt.year
     df["dow"] = df["draw_date"].dt.day_name()
     pp_year = df.groupby(["year", "multiplier"]).size().reset_index(name="count")
-    dow = df["dow"].value_counts().sort_index()
+    dow = df["dow"].value_counts().sort_index().rename_axis("dow").reset_index(name="count")
 
-    # Top 30 white-ball pairs
-    def row_pairs(row):
-        balls = row.values
-        return list(itertools.combinations(sorted(balls), 2))
-
+    # --- combinations heatmap prep (top 30 pairs) ---
     pair_counts = {}
     for i in range(whites.shape[0]):
-        for pair in row_pairs(whites.iloc[i]):
-            pair_counts[pair] = pair_counts.get(pair, 0) + 1
+        balls = sorted(whites.iloc[i].values)
+        for a, b in itertools.combinations(balls, 2):
+            pair_counts[(a, b)] = pair_counts.get((a, b), 0) + 1
     top_pairs = sorted(pair_counts.items(), key=lambda kv: kv[1], reverse=True)[:30]
     pairs_df = pd.DataFrame([(a, b, c) for ((a, b), c) in top_pairs], columns=["a", "b", "count"])
 
-    # Sum & spread over time
+    # --- sum & spread over time ---
     sums = whites.sum(axis=1)
     spreads = whites.max(axis=1) - whites.min(axis=1)
     trend_df = pd.DataFrame({"draw_date": df["draw_date"], "sum": sums, "spread": spreads})
 
-    # ---------- figures ----------
+    # ---------- Captured custom charts (for GO / custom logic) ----------
+    @capture("graph")
+    def pairs_heatmap(data_frame):
+        import plotly.graph_objects as go
+        mat = data_frame.pivot_table(index="a", columns="b", values="count").fillna(0)
+        fig = go.Figure(go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title="count")))
+        fig.update_layout(title="Top Pair Combinations (counts)")
+        return fig
+
+    @capture("graph")
+    def sum_spread_lines(data_frame):
+        import plotly.graph_objects as go
+        fig = go.Figure()
+        fig.add_trace(go.Scatter(x=data_frame["draw_date"], y=data_frame["sum"], mode="lines", name="sum(whites)"))
+        fig.add_trace(go.Scatter(x=data_frame["draw_date"], y=data_frame["spread"], mode="lines", name="spread(max-min)"))
+        fig.update_layout(title="Sum & Spread over Time")
+        return fig
+
+    # ---------- Vizro pages (use Vizro PX wrapper; pass data_frame ONCE via keyword) ----------
+    page1 = vm.Page(
+        title="Explorer",
+        components=[
+            vm.Graph(figure=vpx.histogram(data_frame=white_df, x="white_ball", nbins=69,
+                                          title="White-ball Frequency (1–69)")),
+            vm.Graph(figure=vpx.histogram(data_frame=pb_df, x="powerball", nbins=26,
+                                          title="Powerball Frequency (1–26)")),
+            vm.Graph(figure=vpx.bar(data_frame=overdue_df, x="white_ball", y="days",
+                                    title=f"Overdue (days) as of {today.date()}")),
+            vm.Graph(figure=vpx.bar(data_frame=pp_year, x="year", y="count", color="multiplier",
+                                    barmode="stack", title="Power Play usage by year")),
+            vm.Graph(figure=vpx.bar(data_frame=dow, x="dow", y="count",
+                                    title="Draws by Day of Week")),
+        ],
+    )
+
+    page2 = vm.Page(
+        title="Combos & Trends",
+        components=[
+            vm.Graph(figure=pairs_heatmap(data_frame=pairs_df)),
+            vm.Graph(figure=sum_spread_lines(data_frame=trend_df)),
+        ],
+    )
+
+    dashboard = vm.Dashboard(pages=[page1, page2])
+
+    # ---------- Optional Vizro export (keep False under Pyodide) ----------
+    CAN_EXPORT = False
+    try:
+        assert isinstance(CAN_EXPORT, bool)
+        if CAN_EXPORT:
+            return {"engine": "vizro", "html": dashboard.to_html()}
+    except Exception as vizro_err:
+        logger.info(f"vizro export unavailable -> fallback: {vizro_err}")
+
+    # ---------- Plotly JSON fallback ----------
     import plotly.express as px
     import plotly.graph_objects as go
 
@@ -102,12 +160,10 @@ def build_dashboard(dataset: str = "d6yy-54nr"):
     fig_pb_hist = px.histogram(pb_df, x="powerball", nbins=26, title="Powerball Frequency (1–26)")
     fig_overdue = px.bar(overdue_df, x="white_ball", y="days", title=f"Overdue (days) as of {today.date()}")
     fig_pp_year = px.bar(pp_year, x="year", y="count", color="multiplier", barmode="stack", title="Power Play usage by year")
-    fig_dow = px.bar(dow, title="Draws by Day of Week")
+    fig_dow = px.bar(dow, x="dow", y="count", title="Draws by Day of Week")
 
     mat = pairs_df.pivot_table(index="a", columns="b", values="count").fillna(0)
-    fig_pairs_heatmap = go.Figure(
-        data=go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title="count"))
-    )
+    fig_pairs_heatmap = go.Figure(go.Heatmap(z=mat.values, x=mat.columns, y=mat.index, colorbar=dict(title="count")))
     fig_pairs_heatmap.update_layout(title="Top Pair Combinations (counts)")
 
     fig_sum_spread = go.Figure()
@@ -115,40 +171,8 @@ def build_dashboard(dataset: str = "d6yy-54nr"):
     fig_sum_spread.add_trace(go.Scatter(x=trend_df["draw_date"], y=trend_df["spread"], mode="lines", name="spread(max-min)"))
     fig_sum_spread.update_layout(title="Sum & Spread over Time")
 
-    # ---------- (optional) Vizro export ----------
-    try:
-        import vizro
-        import vizro.components as vz
-        from vizro.models import Page, Dashboard
-
-        page1 = Page(
-            title="Explorer",
-            components=[
-                vz.Graph(figure=fig_white_hist),
-                vz.Graph(figure=fig_pb_hist),
-                vz.Graph(figure=fig_overdue),
-                vz.Graph(figure=fig_pp_year),
-                vz.Graph(figure=fig_dow),
-            ],
-        )
-        page2 = Page(
-            title="Combos & Trends",
-            components=[
-                vz.Graph(figure=fig_pairs_heatmap),
-                vz.Graph(figure=fig_sum_spread),
-            ],
-        )
-        app = Dashboard(pages=[page1, page2])
-
-        CAN_EXPORT = False
-        assert isinstance(CAN_EXPORT, bool)
-        if CAN_EXPORT:
-            return {"html": app.to_html()}  # adjust for your Vizro version if different
-    except Exception as vizro_err:
-        logger.info(f"vizro export unavailable -> fallback: {vizro_err}")
-
-    # ---------- JSON fallback for front-end rendering ----------
     return {
+        "engine": "plotly",
         "figures": {
             "white_hist": json.loads(fig_white_hist.to_json()),
             "pb_hist": json.loads(fig_pb_hist.to_json()),
