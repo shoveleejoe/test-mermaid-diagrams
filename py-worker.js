@@ -1,5 +1,5 @@
 // py-worker.js — Pyodide Web Worker with structured logging, stdout/err capture,
-// performance marks, and a Vizro-or-Plotly build pipeline.
+// performance marks, and a Vizro-or-Plotly build pipeline (open_url + datetime-safe).
 //
 // Messages supported:
 //   { type: "init", id, payload: { pyodideIndexURL, pyodidePackages[], micropipPackages[] } }
@@ -9,16 +9,6 @@
 //   { type: "result", id, payload: { html } }   // if Vizro HTML export is available
 //   { type: "result", id, payload: { figures } } // Plotly JSON fallback
 // or: { type: "result", id, error: "..." }
-//
-// Networking note:
-//   We use first-party browser-aware helpers from pyodide.http (open_url) rather than
-//   monkey-patching urllib/requests. open_url() yields a StringIO-like object that
-//   pandas.read_json can consume directly.
-//
-// Refs:
-//   • pyodide.http.open_url (stable): https://pyodide.org/en/stable/usage/api/python-api/http.html
-//   • pandas.read_json accepts file-like objects: https://pandas.pydata.org/docs/reference/api/pandas.read_json.html
-//   • Pyodide in a web worker: https://pyodide.org/en/stable/usage/webworker.html
 
 let pyodide = null;
 
@@ -136,7 +126,7 @@ import sys, json, math, itertools, logging
 from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
-from pyodide.http import open_url  # first-party browser-aware helper (sync)  # :contentReference[oaicite:1]{index=1}
+from pyodide.http import open_url  # first-party browser-aware helper (sync)  # refs: pyodide docs  :contentReference[oaicite:1]{index=1}
 
 # ---------- logging ----------
 logger = logging.getLogger("pb.pipeline")
@@ -151,11 +141,11 @@ logger.info("bootstrap python logging started")
 # ---------- fetch (via open_url → file-like stream for pandas.read_json) ----------
 base = f"https://data.ny.gov/resource/${dataset}.json?$select=draw_date,winning_numbers,multiplier&$order=draw_date%20ASC&$limit=50000"
 logger.info("fetch begin", extra={"stage":"fetch","endpoint":base})
-df = pd.read_json(open_url(base))  # pandas accepts file-like objects (StringIO)  # :contentReference[oaicite:2]{index=2}
+df = pd.read_json(open_url(base))  # pandas accepts file-like objects (StringIO)  # refs: pandas docs  :contentReference[oaicite:2]{index=2}
 logger.info("fetch ok", extra={"rows": int(df.shape[0])})
 
-# normalize draw_date to date (UTC->date)
-df["draw_date"] = pd.to_datetime(df["draw_date"], utc=True).dt.date
+# Keep as datetime64[ns, UTC] (do NOT .dt.date)
+df["draw_date"] = pd.to_datetime(df["draw_date"], utc=True)
 
 # ---------- parse ----------
 logger.info("parse numbers begin")
@@ -169,17 +159,27 @@ white_df = pd.DataFrame({
 pb_df = pd.DataFrame({"draw_date": df["draw_date"], "powerball": powerball})
 logger.info("parse numbers done", extra={"white_rows": int(white_df.shape[0])})
 
+# ---------- bonus sanity checks ----------
+logger.info(f"dtypes after parse: {df.dtypes.to_dict()}")
+logger.info(f"draw_date dtype: {df['draw_date'].dtype}")  # expect datetime64[ns, UTC]
+
 # ---------- aggregates ----------
-today = df["draw_date"].max()
+today = df["draw_date"].max()  # Timestamp
 last_seen = white_df.groupby("white_ball")["draw_date"].max()
-overdue = (today - last_seen).dt.days.sort_values(ascending=False)
-overdue_df = overdue.reset_index(names="white_ball").rename(columns={0:"days"})
+logger.info(f"last_seen dtype: {last_seen.dtype}")         # expect datetime64[ns, UTC]
 
-df["year"] = pd.to_datetime(df["draw_date"]).dt.year
+overdue = (today - last_seen).dt.days
+overdue_df = (
+    overdue.sort_values(ascending=False)
+            .rename("days")
+            .reset_index()
+            .rename(columns={"index": "white_ball"})
+)
+
+df["year"] = df["draw_date"].dt.year
+df["dow"]  = df["draw_date"].dt.day_name()
 pp_year = df.groupby(["year","multiplier"]).size().reset_index(name="count")
-
-df["dow"] = pd.to_datetime(df["draw_date"]).dt.day_name()
-dow = df["dow"].value_counts().sort_index()
+dow     = df["dow"].value_counts().sort_index()
 
 # Top 30 white-ball pairs
 def row_pairs(row):
@@ -206,7 +206,7 @@ try:
 
     fig_white_hist = px.histogram(white_df, x="white_ball", nbins=69, title="White-ball Frequency (1–69)")
     fig_pb_hist    = px.histogram(pb_df,   x="powerball",  nbins=26, title="Powerball Frequency (1–26)")
-    fig_overdue    = px.bar(overdue_df, x="white_ball", y="days", title=f"Overdue (days) as of {today}")
+    fig_overdue    = px.bar(overdue_df, x="white_ball", y="days", title=f"Overdue (days) as of {today.date()}")
     fig_pp_year    = px.bar(pp_year, x="year", y="count", color="multiplier", barmode="stack", title="Power Play usage by year")
     fig_dow        = px.bar(dow, title="Draws by Day of Week")
 
@@ -243,8 +243,8 @@ try:
         )
         app = Dashboard(pages=[page1, page2])
 
-        # If your Vizro build exposes an HTML export (e.g., app.to_html()), flip CAN_EXPORT=True.
-        CAN_EXPORT = False
+        // If your Vizro build exposes an HTML export (e.g., app.to_html()), flip CAN_EXPORT=True.
+        CAN_EXPORT = false
         if CAN_EXPORT:
             html = app.to_html()  # replace with the correct API for your version
             result["html"] = html
