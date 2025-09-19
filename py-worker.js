@@ -1,21 +1,24 @@
 // py-worker.js — Pyodide Web Worker with structured logging, stdout/err capture,
 // performance marks, and a Vizro-or-Plotly build pipeline.
 //
-// This worker supports two messages:
+// Messages supported:
 //   { type: "init", id, payload: { pyodideIndexURL, pyodidePackages[], micropipPackages[] } }
 //   { type: "build_dashboard", id, payload: { dataset: "d6yy-54nr" } }
 //
-// It returns:
+// Returns either:
 //   { type: "result", id, payload: { html } }   // if Vizro HTML export is available
 //   { type: "result", id, payload: { figures } } // Plotly JSON fallback
-// or an error: { type: "result", id, error: "..." }
+// or: { type: "result", id, error: "..." }
 //
-// Docs referenced in the chat message:
+// Networking note:
+//   We use first-party browser-aware helpers from pyodide.http (open_url) rather than
+//   monkey-patching urllib/requests. open_url() yields a StringIO-like object that
+//   pandas.read_json can consume directly.
 //
-//  - Pyodide in a Web Worker (pattern, postMessage plumbing) — pyodide.org
-//  - Redirecting Python stdout/stderr to JS — pyodide.setStdout / setStderr
-//  - Loading packages — pyodide.loadPackage, loadPackagesFromImports, micropip.install
-//  - Performance.mark/measure support in workers — MDN
+// Refs:
+//   • pyodide.http.open_url (stable): https://pyodide.org/en/stable/usage/api/python-api/http.html
+//   • pandas.read_json accepts file-like objects: https://pandas.pydata.org/docs/reference/api/pandas.read_json.html
+//   • Pyodide in a web worker: https://pyodide.org/en/stable/usage/webworker.html
 
 let pyodide = null;
 
@@ -70,10 +73,7 @@ async function initPyodideAndPackages(opts) {
   wmark("init:pyodide:start");
 
   const { loadPyodide } = await import(`${pyodideIndexURL}pyodide.mjs`);
-  pyodide = await loadPyodide({
-    indexURL: pyodideIndexURL,
-    // You can also pass stdout/stderr callbacks here; we’ll use setStdout/Err below.
-  });
+  pyodide = await loadPyodide({ indexURL: pyodideIndexURL });
 
   wmark("init:pyodide:end"); wmeasure("init:pyodide", "init:pyodide:start", "init:pyodide:end");
   wlog("info", "init", "pyodide ready");
@@ -82,7 +82,7 @@ async function initPyodideAndPackages(opts) {
   try {
     pyodide.setStdout({ batched: (s) => s && wlog("info", "py.stdout", s) });
     pyodide.setStderr({ batched: (s) => s && wlog("error", "py.stderr", s) });
-    // pyodide.setDebug?.(true); // uncomment for very verbose diagnostics
+    // pyodide.setDebug?.(true); // uncomment for verbose diagnostics
     wlog("info", "init", "wired py stdout/stderr");
   } catch (e) {
     wlog("warn", "init", "setStdout/Err failed", { error: String(e) });
@@ -136,6 +136,7 @@ import sys, json, math, itertools, logging
 from datetime import datetime, timezone
 import pandas as pd
 import numpy as np
+from pyodide.http import open_url  # first-party browser-aware helper (sync)  # :contentReference[oaicite:1]{index=1}
 
 # ---------- logging ----------
 logger = logging.getLogger("pb.pipeline")
@@ -147,10 +148,10 @@ if not logger.handlers:
     logger.addHandler(_sh)
 logger.info("bootstrap python logging started")
 
-# ---------- fetch ----------
+# ---------- fetch (via open_url → file-like stream for pandas.read_json) ----------
 base = f"https://data.ny.gov/resource/${dataset}.json?$select=draw_date,winning_numbers,multiplier&$order=draw_date%20ASC&$limit=50000"
 logger.info("fetch begin", extra={"stage":"fetch","endpoint":base})
-df = pd.read_json(base)
+df = pd.read_json(open_url(base))  # pandas accepts file-like objects (StringIO)  # :contentReference[oaicite:2]{index=2}
 logger.info("fetch ok", extra={"rows": int(df.shape[0])})
 
 # normalize draw_date to date (UTC->date)
@@ -279,9 +280,7 @@ json.dumps(result)
     return { html: obj.html };
   }
   if (obj && obj.figures) {
-    wlog("info", "build", "produced Plotly figures", {
-      keys: Object.keys(obj.figures || {})
-    });
+    wlog("info", "build", "produced Plotly figures", { keys: Object.keys(obj.figures || {}) });
     return { figures: obj.figures };
   }
   if (obj && obj.error) {
